@@ -18,6 +18,8 @@ START_DATE = "2007-01-01"
 BUY_COST = 0.001
 SELL_COST = 0.001
 THRESHOLD = -0.15
+STRATEGY_VERSION = "2.5"
+STRATEGY_NAME = "VIX 단독 2.5 QLD 전용"
 SYMBOLS = ["QLD", "IAU", "IEF", "VWO", "TIP", "EFA", "^VIX", "QQQ"]
 NAMES = {
     "QLD": "ProShares Ultra QQQ",
@@ -345,6 +347,49 @@ def weekly_filter_signals(series: dict, base_dates: list[str], end_date: str) ->
     return signals, states
 
 
+def filter_weights(base_target: str, weekly_risk: bool) -> tuple[float, float]:
+    applied = base_target == "QLD" and weekly_risk
+    return (0.5, 0.5) if applied else (1.0, 0.0)
+
+
+def qld_only_filter_signals(vix_component: dict, weekly_signals: dict, monthly_trades: list[dict]) -> tuple[dict, dict]:
+    schedules, states = {}, {}
+    weekly_risk = False
+    weekly_signal_date = ""
+    monthly_signal_date = ""
+    monthly_idx = 0
+    current_weight = 1.0
+    for date in vix_component["dates"]:
+        while monthly_idx < len(monthly_trades) and monthly_trades[monthly_idx]["tradeDate"] <= date:
+            monthly_signal_date = monthly_trades[monthly_idx]["signalDate"]
+            monthly_idx += 1
+        if date in weekly_signals:
+            weekly_risk = weekly_signals[date]["vixWeight"] < 1.0
+            weekly_signal_date = weekly_signals[date]["signalDate"]
+        base_target = vix_component["by_date"][date]["holding"]
+        vix_weight, gold_weight = filter_weights(base_target, weekly_risk)
+        states[date] = {"weeklyRiskState": weekly_risk, "weeklyFilterApplied": vix_weight < 1.0}
+        if vix_weight != current_weight:
+            if vix_weight < 1.0:
+                reason = "weekly_defense_on" if date in weekly_signals else "monthly_qld_reentry"
+            else:
+                reason = "monthly_defense" if base_target != "QLD" else "weekly_defense_off"
+            schedules[date] = {
+                **weekly_signals.get(date, {}),
+                "signalDate": max(monthly_signal_date, weekly_signal_date),
+                "tradeDate": date,
+                "monthlySignalDate": monthly_signal_date,
+                "weeklySignalDate": weekly_signal_date,
+                "baseTarget": base_target,
+                "weeklyRiskState": weekly_risk,
+                "reason": reason,
+                "vixWeight": vix_weight,
+                "goldWeight": gold_weight,
+            }
+            current_weight = vix_weight
+    return schedules, states
+
+
 def run_overlay(vix_component: dict, gold_component: dict, schedules: dict, internal_trade_count: int) -> dict:
     dates = [d for d in vix_component["dates"] if d in gold_component["by_date"]]
     weights = {"vix": 1.0, "gold": 0.0}
@@ -434,27 +479,34 @@ def summarize(daily: list[dict], overlay_trades: list[dict], internal_trade_coun
     }, monthly
 
 
-def build_payload() -> dict:
-    raw = {symbol: fetch_yahoo(symbol) for symbol in SYMBOLS}
+def build_payload(raw: dict | None = None, as_of: pd.Timestamp | None = None) -> dict:
+    if raw is None:
+        raw = {symbol: fetch_yahoo(symbol) for symbol in SYMBOLS}
     series = {KEYS[symbol]: prepare(df, include_hilo=(symbol == "QQQ")) for symbol, df in raw.items()}
     end_date = min(series[k]["dates"][-1] for k in ["QLD", "GOLD", "TREASURY", "EM", "TIPS", "DEV_EXUS", "VIX", "QQQ"])
-    today = pd.Timestamp.now(tz="Asia/Seoul")
+    today = pd.Timestamp.now(tz="Asia/Seoul") if as_of is None else as_of
     end_ts = pd.Timestamp(end_date)
     signal_end_month = (end_ts.replace(day=1) - pd.DateOffset(days=1)).strftime("%Y-%m") if end_ts.strftime("%Y-%m") == today.strftime("%Y-%m") else end_ts.strftime("%Y-%m")
     vix_result = run_vix11(series, end_date, signal_end_month)
     vix_component = build_vix_component(series, vix_result, end_date)
     gold_component = build_asset_component(series, "GOLD", vix_component["dates"])
     weekly_signals, weekly_states = weekly_filter_signals(series, vix_component["dates"], end_date)
-    overlay = run_overlay(vix_component, gold_component, weekly_signals, len([t for t in vix_result["trades"] if START_DATE <= t["tradeDate"] <= end_date]))
+    schedules, applied_states = qld_only_filter_signals(vix_component, weekly_signals, vix_result["trades"])
+    overlay = run_overlay(vix_component, gold_component, schedules, len([t for t in vix_result["trades"] if START_DATE <= t["tradeDate"] <= end_date]))
+    for row in overlay["daily"]:
+        row.update(applied_states[row["date"]])
     latest_vix_signal = vix_result["signals"][-1]
     latest_weekly = weekly_states[-1] if weekly_states else None
     current_daily = overlay["daily"][-1]
     next_vix_holding = latest_vix_signal["target"]
-    next_vix_weight = latest_weekly["vixWeight"] if latest_weekly else current_daily["vixWeight"]
-    next_gold_weight = latest_weekly["goldWeight"] if latest_weekly else current_daily["goldWeight"]
+    next_weekly_risk = latest_weekly["vixWeight"] < 1.0 if latest_weekly else current_daily["weeklyRiskState"]
+    next_vix_weight, next_gold_weight = filter_weights(next_vix_holding, next_weekly_risk)
+    next_signal_date = max(latest_vix_signal["signalDate"], latest_weekly["signalDate"] if latest_weekly else "")
     next_holding = combined_holding(next_vix_holding, next_vix_weight, next_gold_weight)
     coverage = [{"symbol": s, "name": NAMES[s], "first": str(raw[s]["date"].iloc[0]), "last": str(raw[s]["date"].iloc[-1]), "rows": int(len(raw[s]))} for s in SYMBOLS]
     return {
+        "strategyVersion": STRATEGY_VERSION,
+        "strategyName": STRATEGY_NAME,
         "generatedAt": pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d %H:%M:%S KST"),
         "dataThrough": end_date,
         "signalThroughMonth": signal_end_month,
@@ -476,6 +528,11 @@ def build_payload() -> dict:
             "nextVixHolding": next_vix_holding,
             "nextVixWeight": next_vix_weight,
             "nextGoldWeight": next_gold_weight,
+            "nextSignalDate": next_signal_date,
+            "nextWeeklyRiskState": next_weekly_risk,
+            "nextFilterApplied": next_vix_weight < 1.0,
+            "weeklyRiskState": current_daily["weeklyRiskState"],
+            "weeklyFilterApplied": current_daily["weeklyFilterApplied"],
             "nextNeedsAdjustment": next_holding != current_daily["holding"],
             "vixSignal": latest_vix_signal,
             "weeklyFilter": latest_weekly,
@@ -489,26 +546,26 @@ HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VIX 단독 2.0 점검</title>
+<title>VIX 단독 2.5 QLD 전용</title>
 <style>
 :root{--bg:#f5f7fb;--panel:#fff;--ink:#142033;--muted:#66758c;--line:#dce3ee;--blue:#3154d4;--green:#12805c;--red:#c84646;--amber:#a46314;--soft:#eef2f7;--shadow:0 10px 24px rgba(20,32,51,.08)}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,system-ui,-apple-system,"Segoe UI","Malgun Gothic",sans-serif;line-height:1.45}
 header{background:var(--panel);border-bottom:1px solid var(--line);padding:20px 24px 14px}h1{margin:0;font-size:24px}.meta{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:8px;color:var(--muted);font-size:13px}
-.shell{max-width:1580px;margin:0 auto;padding:18px 24px 36px;display:grid;grid-template-columns:360px minmax(0,1fr);gap:18px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);overflow:hidden}.head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--soft)}.head h2{margin:0;font-size:15px}.body{padding:16px}.stack{display:grid;gap:13px}
+.shell{max-width:1580px;margin:0 auto;padding:18px 24px 36px;display:grid;grid-template-columns:360px minmax(0,1fr);gap:18px}.shell>main{min-width:0}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);overflow:hidden}.head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--soft)}.head h2{margin:0;font-size:15px}.body{padding:16px;min-width:0}.stack{display:grid;gap:13px}
 .label{display:block;color:var(--muted);font-size:12px;font-weight:800;margin-bottom:5px}.big{font-size:28px;font-weight:950;line-height:1}.muted{color:var(--muted)}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:12px;font-weight:900}.pill.ok{background:#e8f6ef;color:var(--green)}.pill.risk{background:#fdecec;color:var(--red)}.pill.neutral{background:#eef2ff;color:var(--blue)}
 button{border:0;border-radius:6px;font-size:13px;font-weight:850;padding:9px 12px;cursor:pointer}.primary{background:var(--green);color:#fff;width:100%}.note{font-size:12px;color:var(--muted)}.status{font-size:12px;color:var(--muted);min-height:34px}.hold-row{display:grid;grid-template-columns:64px 1fr 44px;gap:8px;align-items:center;font-size:13px}.bar{height:8px;border-radius:999px;background:#e8edf5;overflow:hidden}.bar span{display:block;height:100%;background:var(--blue)}.coverage{display:grid;gap:7px}.coverage-row{display:grid;grid-template-columns:48px 1fr 82px;gap:8px;font-size:12px;color:var(--muted)}
 .kpis{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:12px}.kpi{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;box-shadow:var(--shadow);min-height:84px}.kpi .name{color:var(--muted);font-size:12px;font-weight:850}.kpi .value{font-size:22px;font-weight:950;margin-top:8px}.kpi .hint{font-size:12px;color:var(--muted);margin-top:7px}
 .grid2{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:14px;margin-top:14px}.chart{width:100%;height:320px;display:block}.short{height:230px}.toolbar{display:flex;gap:8px;align-items:center}.mini-select{border:1px solid var(--line);border-radius:6px;padding:6px 8px;background:#fff}
 table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:8px 9px;border-bottom:1px solid var(--soft);text-align:right;white-space:nowrap}th{color:var(--muted);font-size:12px;font-weight:850;background:#fafbfd}td.text,th.text{text-align:left}.wrap{overflow:auto;max-height:360px}.seg{display:flex;gap:6px;flex-wrap:wrap}.seg button{background:#edf1f7;color:var(--muted)}.seg button.active{background:var(--blue);color:#fff}
-.heat{display:grid;gap:3px}.heat-row{display:grid;grid-template-columns:52px repeat(12,minmax(54px,1fr));gap:3px}.heat-cell{border-radius:4px;min-height:28px;display:flex;align-items:center;justify-content:center;font-weight:850;font-size:12px}.heat-label{color:var(--muted);font-size:12px;display:flex;align-items:center}
+.heat{display:grid;gap:3px;overflow-x:auto}.heat-row{display:grid;grid-template-columns:52px repeat(12,minmax(54px,1fr));gap:3px}.heat-cell{border-radius:4px;min-height:28px;display:flex;align-items:center;justify-content:center;font-weight:850;font-size:12px}.heat-label{color:var(--muted);font-size:12px;display:flex;align-items:center}
 .tooltip{position:fixed;z-index:20;display:none;pointer-events:none;background:#111827;color:#fff;border-radius:6px;padding:8px 10px;font-size:12px;line-height:1.45;box-shadow:0 10px 24px rgba(0,0,0,.22)}.tooltip b{display:block;margin-bottom:4px}
 @media(max-width:1100px){.shell{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}}@media(max-width:720px){.shell{padding:14px}.kpis{grid-template-columns:1fr}.heat-row{grid-template-columns:44px repeat(12,48px)}}
 </style>
 </head>
 <body>
 <header>
-  <h1>VIX 단독 2.0 점검</h1>
-  <div class="meta"><span id="generated"></span><span id="through"></span><span>주간 QQQ 필터 + 월간 VIX 단독 1.1</span></div>
+  <h1>VIX 단독 2.5 QLD 전용</h1>
+  <div class="meta"><span id="generated"></span><span id="through"></span><span>월간 VIX 1.1 · QLD 보유 시 주간 방어</span></div>
 </header>
 <div class="shell">
   <aside class="panel">
@@ -532,7 +589,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:8px 9px;b
       <section class="panel"><div class="head"><h2>Drawdown</h2><span class="muted">일별 기준</span></div><div class="body"><canvas id="ddChart" class="chart short"></canvas></div></section>
     </div>
     <div class="grid2">
-      <section class="panel"><div class="head"><h2>거래내역</h2><div class="seg"><button id="showOverlay" class="active">2.0 필터</button><button id="showVix">VIX 1.1</button></div></div><div class="body"><div class="wrap"><table id="tradeTable"></table></div></div></section>
+      <section class="panel"><div class="head"><h2>거래내역</h2><div class="seg"><button id="showOverlay" class="active">2.5 비중조정</button><button id="showVix">VIX 1.1</button></div></div><div class="body"><div class="wrap"><table id="tradeTable"></table></div></div></section>
       <section class="panel"><div class="head"><h2>연도별 수익률</h2></div><div class="body"><div class="wrap"><table id="yearTable"></table></div></div></section>
     </div>
     <section class="panel" style="margin-top:14px"><div class="head"><h2>월별 수익률</h2></div><div class="body"><div id="heatmap" class="heat"></div></div></section>
@@ -547,6 +604,8 @@ const $ = id => document.getElementById(id);
 const fmtPct=(v,d=2)=>Number.isFinite(v)?(v*100).toFixed(d)+'%':'-';
 const fmtNum=(v,d=2)=>Number.isFinite(v)?v.toFixed(d):'-';
 const fmtDateKr=d=>{if(!d)return'-'; const [y,m,day]=d.split('-'); return `${Number(y)}년 ${Number(m)}월 ${Number(day)}일`;};
+const assetLabel=s=>({GOLD:'IAU',TREASURY:'IEF',QLD:'QLD'}[s]||s||'-');
+const reasonLabel=s=>({weekly_defense_on:'주간 방어',weekly_defense_off:'주간 복귀',monthly_defense:'월말 방어자산 전환',monthly_qld_reentry:'QLD 복귀 · 주간 방어 유지'}[s]||'초기 편입');
 let tradeMode='overlay', year='all';
 function render(){
   $('generated').textContent='생성: '+DATA.generatedAt;
@@ -559,17 +618,17 @@ function holdingRows(text){
 }
 function renderCurrent(){
   $('currentHoldings').innerHTML = holdingRows(DATA.current.holding);
-  $('nextHoldingLabel').textContent = `다음 거래일 목표 보유 (신호날짜: ${fmtDateKr(DATA.current.weeklyFilter.signalDate)})`;
+  $('nextHoldingLabel').textContent = `다음 거래일 목표 보유 (신호날짜: ${fmtDateKr(DATA.current.nextSignalDate)})`;
   const need=DATA.current.nextNeedsAdjustment;
-  $('nextHoldings').innerHTML = `${holdingRows(DATA.current.nextHolding)}<div class="note"><span class="pill ${need?'risk':'ok'}">${need?'조정 필요':'변경 없음'}</span> VIX 전략 목표 ${DATA.current.nextVixHolding}, 2.0 비중 ${fmtPct(DATA.current.nextVixWeight,0)} / ${fmtPct(DATA.current.nextGoldWeight,0)}</div>`;
-  const f=DATA.current.weeklyFilter, active=DATA.current.vixWeight<1;
-  $('weeklyFilter').innerHTML=`<span class="pill ${active?'risk':'ok'}">${active?'필터 ON':'필터 OFF'}</span><div class="note">신호일 ${f.signalDate}, QQQ 종가 ${fmtNum(f.qqqWeeklyClose,2)}, 10주선 ${fmtNum(f.qqqWeeklyMa10,2)}</div><div class="note">20주 고점 이후 낙폭 ${fmtPct(f.ordered20wDrawdown)} / 기준 ${fmtPct(DATA.threshold,0)}</div>`;
+  $('nextHoldings').innerHTML = `${holdingRows(DATA.current.nextHolding)}<div class="note"><span class="pill ${need?'risk':'ok'}">${need?'조정 필요':'변경 없음'}</span> 월말 목표 ${assetLabel(DATA.current.nextVixHolding)} · 추가 IAU ${fmtPct(DATA.current.nextGoldWeight,0)}</div>`;
+  const f=DATA.current.weeklyFilter, risk=DATA.current.nextWeeklyRiskState, applied=DATA.current.nextFilterApplied;
+  $('weeklyFilter').innerHTML=`<span class="pill ${risk?'risk':'ok'}">${risk?'QQQ 위험 ON':'QQQ 위험 OFF'}</span> <span class="pill ${applied?'risk':'neutral'}">${applied?'다음 목표에 50% 방어 적용':'다음 목표에 추가 방어 없음'}</span><div class="note">신호일 ${f.signalDate}, QQQ 종가 ${fmtNum(f.qqqWeeklyClose,2)}, 10주선 ${fmtNum(f.qqqWeeklyMa10,2)}</div><div class="note">20주 고점 이후 낙폭 ${fmtPct(f.ordered20wDrawdown)} / 기준 ${fmtPct(DATA.threshold,0)}</div>`;
   const v=DATA.current.vixSignal;
-  $('vixSignal').innerHTML=`<span class="pill ${v.risk?'risk':'ok'}">${v.risk?'위험':'정상'}</span><div class="note">월간 신호 ${v.signalDate}, 목표 ${v.target}</div><div class="note">VIX 20일 평균 대비 ${fmtPct(v.vixPremiumToMa20)} / 카나리아 위험 ${v.canaryRiskCount}개</div>`;
+  $('vixSignal').innerHTML=`<span class="pill ${v.risk?'risk':'ok'}">${v.risk?'위험':'정상'}</span><div class="note">월간 신호 ${v.signalDate}, 목표 ${assetLabel(v.target)}</div><div class="note">VIX 20일 평균 대비 ${fmtPct(v.vixPremiumToMa20)} / 카나리아 위험 ${v.canaryRiskCount}개</div>`;
 }
 function renderKpis(){
   const s=DATA.summary;
-  const rows=[['최종 NAV',fmtNum(s.finalNav,2)+'배','초기 1 기준'],['CAGR',fmtPct(s.cagr),'연복리'],['MDD',fmtPct(s.maxDrawdown),s.maxDrawdownDate],['변동성',fmtPct(s.volatility),'연율화'],['Sharpe',fmtNum(s.sharpe,2),'CAGR/변동성'],['거래횟수',String(s.tradeEvents),'VIX 내부 + 2.0 필터']];
+  const rows=[['최종 NAV',fmtNum(s.finalNav,2)+'배','초기 1 기준'],['CAGR',fmtPct(s.cagr),'연복리'],['MDD',fmtPct(s.maxDrawdown),s.maxDrawdownDate],['변동성',fmtPct(s.volatility),'연율화'],['Sharpe',fmtNum(s.sharpe,2),'CAGR/변동성'],['거래횟수',String(s.tradeEvents),'월말 자산변경 + 2.5 비중조정']];
   $('kpis').innerHTML=rows.map(r=>`<div class="kpi"><div class="name">${r[0]}</div><div class="value">${r[1]}</div><div class="hint">${r[2]}</div></div>`).join('');
 }
 function renderYearOptions(){const years=DATA.yearly.map(r=>r.year); $('yearSelect').innerHTML=['all',...years].map(y=>`<option value="${y}">${y==='all'?'전체':y}</option>`).join(''); $('yearSelect').value=year;}
@@ -584,13 +643,13 @@ function drawLine(canvas, rows, field, color, maxOverride=null){
 }
 function renderCharts(){const rows=year==='all'?DATA.daily:DATA.daily.filter(r=>r.date.slice(0,4)===year); drawLine($('navChart'),rows.length>1?rows:DATA.daily,'nav','#3154d4'); drawLine($('ddChart'),DATA.daily,'drawdown','#c84646',0)}
 function renderTrades(){
-  if(tradeMode==='overlay') $('tradeTable').innerHTML='<thead><tr><th class="text">거래일</th><th>신호일</th><th>VIX전략</th><th>IAU</th><th>20주 낙폭</th><th>비용</th></tr></thead><tbody>'+DATA.overlayTrades.map(t=>`<tr><td class="text">${t.tradeDate}</td><td>${t.signalDate||'-'}</td><td>${fmtPct(t.vixWeight,0)}</td><td>${fmtPct(t.goldWeight,0)}</td><td>${fmtPct(t.ordered20wDrawdown)}</td><td>${fmtNum(t.cost,4)}</td></tr>`).join('')+'</tbody>';
+  if(tradeMode==='overlay') $('tradeTable').innerHTML='<thead><tr><th class="text">거래일</th><th>신호일</th><th>기본전략</th><th>추가 IAU</th><th class="text">변경 이유</th><th>비용</th></tr></thead><tbody>'+DATA.overlayTrades.map(t=>`<tr><td class="text">${t.tradeDate}</td><td>${t.signalDate||'-'}</td><td>${fmtPct(t.vixWeight,0)}</td><td>${fmtPct(t.goldWeight,0)}</td><td class="text">${reasonLabel(t.reason)}</td><td>${fmtNum(t.cost,4)}</td></tr>`).join('')+'</tbody>';
   else $('tradeTable').innerHTML='<thead><tr><th class="text">거래일</th><th>신호일</th><th>목표</th><th>위험</th><th>VIX</th><th>카나리아</th></tr></thead><tbody>'+DATA.vixTrades.map(t=>`<tr><td class="text">${t.tradeDate}</td><td>${t.signalDate}</td><td>${t.target}</td><td><span class="pill ${t.risk?'risk':'ok'}">${t.risk?'ON':'OFF'}</span></td><td>${fmtPct(t.vixPremiumToMa20)}</td><td>${t.canaryRiskCount}</td></tr>`).join('')+'</tbody>';
 }
 function renderYears(){ $('yearTable').innerHTML='<thead><tr><th class="text">연도</th><th>수익률</th></tr></thead><tbody>'+DATA.yearly.map(r=>`<tr><td class="text">${r.year}</td><td style="color:${r.return>=0?'var(--green)':'var(--red)'}">${fmtPct(r.return)}</td></tr>`).join('')+'</tbody>'; }
 function heatColor(ret){const c=Math.max(-.18,Math.min(.18,ret||0)); if(c>=0){const a=Math.min(1,c/.1); return `rgba(${Math.round(230-145*a)},${Math.round(241-65*a)},${Math.round(234-126*a)},1)`} const a=Math.min(1,Math.abs(c)/.1); return `rgba(${Math.round(250-45*a)},${Math.round(232-132*a)},${Math.round(232-132*a)},1)`}
 function renderHeatmap(){const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'], years=[...new Set(DATA.monthly.map(r=>r.month.slice(0,4)))], by=Object.fromEntries(DATA.monthly.map(r=>[r.month,r])); let html=`<div class="heat-row"><div></div>${months.map(m=>`<div class="heat-label">${m}</div>`).join('')}</div>`; for(const y of years){html+=`<div class="heat-row"><div class="heat-label">${y}</div>`+months.map((m,i)=>{const key=`${y}-${String(i+1).padStart(2,'0')}`, r=by[key]; if(!r)return'<div></div>'; const fg=r.return>=.035||r.return<=-.035?'#fff':'#111827'; return `<div class="heat-cell" style="background:${heatColor(r.return)};color:${fg}" title="${key}">${(r.return*100).toFixed(1)}</div>`}).join('')+'</div>'} $('heatmap').innerHTML=html;}
-function renderHoldings(){ $('holdingTable').innerHTML='<thead><tr><th class="text">월</th><th>NAV</th><th>수익률</th><th class="text">월말 보유</th><th>VIX전략</th><th>2.0 비중</th></tr></thead><tbody>'+DATA.monthly.slice().reverse().map(r=>`<tr><td class="text">${r.month}</td><td>${fmtNum(r.nav,2)}</td><td style="color:${r.return>=0?'var(--green)':'var(--red)'}">${fmtPct(r.return)}</td><td class="text">${r.holding}</td><td>${r.vixHolding}</td><td>${fmtPct(r.vixWeight,0)} / ${fmtPct(r.goldWeight,0)}</td></tr>`).join('')+'</tbody>'; }
+function renderHoldings(){ $('holdingTable').innerHTML='<thead><tr><th class="text">월</th><th>NAV</th><th>수익률</th><th class="text">월말 보유</th><th>월말 기본목표</th><th>기본전략 / 추가 IAU</th></tr></thead><tbody>'+DATA.monthly.slice().reverse().map(r=>`<tr><td class="text">${r.month}</td><td>${fmtNum(r.nav,2)}</td><td style="color:${r.return>=0?'var(--green)':'var(--red)'}">${fmtPct(r.return)}</td><td class="text">${r.holding}</td><td>${assetLabel(r.vixHolding)}</td><td>${fmtPct(r.vixWeight,0)} / ${fmtPct(r.goldWeight,0)}</td></tr>`).join('')+'</tbody>'; }
 function tooltip(e){const c=e.currentTarget._chart;if(!c)return;const rect=e.currentTarget.getBoundingClientRect(), n=c.rows.length, idx=Math.max(0,Math.min(n-1,Math.round((e.clientX-rect.left-c.p.l)*(n-1)/(rect.width-c.p.l-c.p.r)))), r=c.rows[idx], tip=$('tooltip'); tip.innerHTML=`<b>${r.date}</b>NAV ${fmtNum(r.nav,2)}<br>MDD ${fmtPct(r.drawdown)}<br>${r.holding}`; tip.style.display='block'; tip.style.left=e.clientX+14+'px'; tip.style.top=e.clientY+14+'px'}
 async function updateData(){const st=$('updateStatus'); if(location.protocol==='file:'){st.textContent='업데이트 버튼은 로컬 서버에서 열었을 때 작동합니다. work/vix20_live_server.py를 실행한 뒤 http://127.0.0.1:8771/vix20_live_portfolio.html 로 열어주세요.'; st.style.color='var(--amber)'; return} $('updateBtn').disabled=true; st.textContent='최신 데이터를 받는 중입니다...'; st.style.color='var(--muted)'; try{const res=await fetch('/api/update',{method:'POST'}); const data=await res.json(); if(!res.ok||!data.ok) throw new Error(data.error||'업데이트 실패'); st.textContent=`업데이트 성공: 데이터 기준일 ${data.dataThrough}. 새로 여는 중입니다.`; st.style.color='var(--green)'; setTimeout(()=>location.href=location.pathname+'?updated='+Date.now(),700)}catch(e){st.textContent='업데이트 실패: '+e.message; st.style.color='var(--red)'; $('updateBtn').disabled=false}}
 $('showOverlay').onclick=()=>{tradeMode='overlay';$('showOverlay').classList.add('active');$('showVix').classList.remove('active');renderTrades()}; $('showVix').onclick=()=>{tradeMode='vix';$('showVix').classList.add('active');$('showOverlay').classList.remove('active');renderTrades()};
